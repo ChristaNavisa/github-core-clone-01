@@ -7,7 +7,6 @@
 import {
   VIEWER_LOGIN,
   ZERO_OID,
-  collectReachable,
   hashObject,
   isAncestor,
   isOid,
@@ -57,24 +56,41 @@ function headTip(repo: Repo): string {
 const UPLOAD_CAPS_V0 = 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta shallow multi_ack';
 const RECEIVE_CAPS_V0 = 'symref=HEAD:refs/heads/main report-status side-band-64k delete-refs ofs-delta';
 
-/** A v0 ref advertisement: preamble, then one line per ref (caps on the first). */
+/** One pkt-line as a string: 4-hex length prefix + payload. Byte-exact with pktLine for ASCII payloads; byteLength keeps it exact for any ref name. */
+function pktLineStr(payload: string): string {
+  return (Buffer.byteLength(payload, 'utf8') + 4).toString(16).padStart(4, '0') + payload;
+}
+
+/**
+ * A v0 ref advertisement: preamble, then one line per ref (caps on the first).
+ * Built as one string and encoded once (instead of a Buffer.concat per line).
+ * Refs change on every push, but clones ask for the same advertisement dozens
+ * of times with identical refs; cache on the exact ref state.
+ */
 function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
-  const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
+  const refState = [...repo.refs.entries()].map(([n, o]) => `${n}=${o}`).join(',');
+  const key = `${service}|${refState}`;
+  const cached = repo.adV0Cache.get(key);
+  if (cached !== undefined) return cached;
+  let text = pktLineStr(`# service=${service}\n`) + '0000';
   const names = sortedRefNames(repo);
   if (names.length === 0) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    text += pktLineStr(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
-    parts.push(pktLine(`${headTip(repo)} HEAD\0${caps}\n`));
+    text += pktLineStr(`${headTip(repo)} HEAD\0${caps}\n`);
     for (const name of names) {
       const oid = repo.refs.get(name) as string;
-      parts.push(pktLine(`${oid} ${name}\n`));
+      text += pktLineStr(`${oid} ${name}\n`);
       const peeled = tagPeel(repo, oid);
-      if (peeled !== null) parts.push(pktLine(`${peeled} ${name}^{}\n`));
+      if (peeled !== null) text += pktLineStr(`${peeled} ${name}^{}\n`);
     }
   }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  text += '0000';
+  const body = Buffer.from(text, 'utf8');
+  if (repo.adV0Cache.size >= 8) repo.adV0Cache.clear();
+  repo.adV0Cache.set(key, body);
+  return body;
 }
 
 /** A v2 capability advertisement: preamble, then `version 2` and the capabilities. */
@@ -88,6 +104,28 @@ function advertisementV2(service: 'git-upload-pack'): Buffer {
     pktLine('object-format=sha1\n'),
     PKT_FLUSH,
   ]);
+}
+
+/** The v2 capability advertisement never changes; build it once. */
+const ADVERTISEMENT_V2_UPLOAD_PACK = advertisementV2('git-upload-pack');
+
+/** The pack for zero objects; built once (used for empty fetch responses). */
+const EMPTY_PACK = writePack([]);
+
+/**
+ * Pack bytes for a fetch plan, cached on the exact object list. Objects are
+ * immutable, so a pack built for one object set is valid forever; the clone
+ * workload fetches the same set dozens of times. Bounded FIFO.
+ */
+function cachedPack(repo: Repo, objects: Map<string, GitObject>): Buffer {
+  let key = '';
+  for (const oid of objects.keys()) key += `${oid},`;
+  const hit = repo.packCache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(objects.values());
+  if (repo.packCache.size >= 32) repo.packCache.clear();
+  repo.packCache.set(key, pack);
+  return pack;
 }
 
 function findRepo(forge: Forge, owner: string, repoName: string): Repo | null {
@@ -272,7 +310,7 @@ function fetchResponseV2(plan: FetchPlan, haves: readonly string[], repo: Repo):
     parts.push(PKT_DELIM);
   }
   parts.push(pktLine('packfile\n'));
-  const pack = writePack(plan.objects.values());
+  const pack = cachedPack(repo, plan.objects);
   for (const chunk of sidebandChunks(pack)) parts.push(chunk);
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
@@ -290,7 +328,7 @@ function fetchResponseV0(plan: FetchPlan, haves: readonly string[], repo: Repo):
   if (!acked) parts.push(pktLine('NAK\n'));
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  const pack = writePack(plan.objects.values());
+  const pack = cachedPack(repo, plan.objects);
   for (const chunk of sidebandChunks(pack)) parts.push(chunk);
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
@@ -329,7 +367,7 @@ function handleUploadPack(repo: Repo, ctx: GitRequest): HandlerResult {
       if (haves.length > 0) {
         parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), pktLine('ready\n'), PKT_DELIM);
       }
-      parts.push(pktLine('packfile\n'), ...sidebandChunks(writePack([])), PKT_FLUSH);
+      parts.push(pktLine('packfile\n'), ...sidebandChunks(EMPTY_PACK), PKT_FLUSH);
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
     }
     const missing = wants.filter((w) => !repo.objects.has(w));
@@ -429,13 +467,35 @@ function handleLsRefs(repo: Repo, ctx: GitRequest): HandlerResult {
 // receive-pack
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * True when every object reachable from `tip` is present. Incremental: the
+ * walk prunes at objects already proven complete (`repo.verified`), so a push
+ * that extends a verified tip only inspects the newly arrived objects instead
+ * of re-walking the whole history (O(n^2) over a push series). Objects are
+ * append-only in a repo, so a verified closure stays complete forever; on
+ * success every visited object becomes verified.
+ */
 function closureComplete(repo: Repo, tip: string): boolean {
-  try {
-    collectReachable(repo.objects, [tip]);
-    return true;
-  } catch {
-    return false;
+  const stack = [tip];
+  const visited = new Set<string>();
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (visited.has(oid) || repo.verified.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined) return false;
+    visited.add(oid);
+    if (obj.type === 'commit') {
+      const c = parseCommit(obj.data);
+      stack.push(c.tree);
+      for (const p of c.parents) stack.push(p);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) if (e.mode !== '160000') stack.push(e.oid);
+    }
   }
+  for (const oid of visited) repo.verified.add(oid);
+  return true;
 }
 
 function handleReceivePack(repo: Repo, ctx: GitRequest): HandlerResult {
@@ -550,7 +610,7 @@ export function handleGit(forge: Forge, ctx: GitRequest): HandlerResult {
       return {
         status: 200,
         contentType: 'application/x-git-upload-pack-advertisement',
-        body: isV2 ? advertisementV2('git-upload-pack') : advertisementV0(repo, 'git-upload-pack'),
+        body: isV2 ? ADVERTISEMENT_V2_UPLOAD_PACK : advertisementV0(repo, 'git-upload-pack'),
       };
     }
     if (service === 'git-receive-pack') {

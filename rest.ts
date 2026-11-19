@@ -21,7 +21,7 @@ import {
   type Repo,
   type TreeEntry,
 } from './store.ts';
-import { emptyResult, errorResult, jsonResult, type HandlerResult } from './web.ts';
+import { JSON_TYPE, emptyResult, errorResult, jsonResult, type HandlerResult } from './web.ts';
 
 export interface RestRequest {
   method: string;
@@ -152,6 +152,20 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     author_association: 'OWNER',
     state_reason: null,
   };
+}
+
+/**
+ * The GET-issue reply, cached per issue. The read workload fetches the same
+ * issue thousands of times; the serialized JSON only changes when the issue
+ * is mutated (PATCH, comment, close), and every mutation site invalidates
+ * the entry. Byte-identical to jsonResult(200, issueJson(...)).
+ */
+function issueResult(repo: Repo, issue: Issue): HandlerResult {
+  const cached = repo.issueJsonCache.get(issue.number);
+  if (cached !== undefined) return { status: 200, contentType: JSON_TYPE, body: cached };
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  repo.issueJsonCache.set(issue.number, body);
+  return { status: 200, contentType: JSON_TYPE, body };
 }
 
 function pullJson(forge: Forge, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -547,15 +561,16 @@ export function handleRest(forge: Forge, req: RestRequest): HandlerResult {
     // issue by number and its comments
     if (tail.length >= 2 && tail[0] === 'issues') {
       const number = Number.parseInt(tail[1] as string, 10);
-      const issue = repo.issues.find((i) => i.number === number);
+      const issue = repo.issueByNumber.get(number);
       if (tail.length === 2) {
         if (issue === undefined) return jsonResult(404, { message: 'Not Found' });
-        if (req.method === 'GET') return jsonResult(200, issueJson(repo, issue));
+        if (req.method === 'GET') return issueResult(repo, issue);
         if (req.method === 'PATCH') {
           const body = bodyOf<{ title?: unknown; body?: unknown; state?: unknown }>(req);
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
           if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
+          repo.issueJsonCache.delete(number);
           return jsonResult(200, issueJson(repo, issue));
         }
         return jsonResult(404, { message: 'Not Found' });

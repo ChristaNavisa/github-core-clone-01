@@ -920,6 +920,7 @@ function resolveRootField(forge: Forge, field: FieldNode, ctx: ExecContext, isMu
       const issue = repo?.issues.find((i) => i.number === Number.parseInt(parsed.parts[2] as string, 10));
       if (repo === undefined || issue === undefined) throw new Error('closeIssue: issue not found');
       issue.state = 'closed';
+      repo.issueJsonCache.delete(issue.number);
       return { __typename: 'CloseIssuePayload', issue: issueValue(repo, issue), clientMutationId: typeof input.clientMutationId === 'string' ? input.clientMutationId : null };
     }
     if (field.name === 'createPullRequest') {

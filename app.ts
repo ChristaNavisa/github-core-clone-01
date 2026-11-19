@@ -24,10 +24,14 @@ function sendResult(res: ServerResponse, result: HandlerResult): void {
   res.end(result.body);
 }
 
-/** The bearer token this entry accepts, or null when no token is configured. */
+/** The bearer token this entry accepts, or null when no token is configured. Read once: the token is fixed before the server starts and never changes during a trial. */
+let cachedExpectedToken: string | null | undefined;
 function expectedToken(): string | null {
-  const token = process.env.MAKEFUN_SHOP_TOKEN;
-  return token === undefined || token === '' ? null : token;
+  if (cachedExpectedToken === undefined) {
+    const token = process.env.MAKEFUN_SHOP_TOKEN;
+    cachedExpectedToken = token === undefined || token === '' ? null : token;
+  }
+  return cachedExpectedToken;
 }
 
 function authorized(req: IncomingMessage): boolean {
@@ -60,6 +64,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function splitPath(pathname: string): string[] {
   return pathname.split('/').filter((s) => s !== '').map((s) => {
+    if (!s.includes('%')) return s;
     try {
       return decodeURIComponent(s);
     } catch {

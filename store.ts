@@ -95,7 +95,23 @@ export interface CommitView {
   message: string;
 }
 
+/**
+ * Parsed commit headers, cached per backing buffer. Commit objects are
+ * immutable once stored, and no caller mutates the returned view, so the
+ * cache is sound. Reachability walks re-parse the same commits on every
+ * push; this makes every repeat parse a map lookup.
+ */
+const commitCache = new WeakMap<Buffer, CommitView>();
+
 export function parseCommit(data: Buffer): CommitView {
+  const hit = commitCache.get(data);
+  if (hit !== undefined) return hit;
+  const parsed = parseCommitUncached(data);
+  commitCache.set(data, parsed);
+  return parsed;
+}
+
+function parseCommitUncached(data: Buffer): CommitView {
   const blank = data.indexOf('\n\n');
   const headEnd = blank < 0 ? data.length : blank;
   const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
@@ -697,10 +713,26 @@ export interface Repo {
   nextNumber: number;
   nextCommentId: number;
   seq: number;
+  /** Object ids whose entire reachable closure is known present in `objects`. */
+  verified: Set<string>;
+  /** Cached pack bytes for fetch responses, keyed by the object list. */
+  packCache: Map<string, Buffer>;
+  /** Cached v0 ref advertisements, keyed by service + ref state. */
+  adV0Cache: Map<string, Buffer>;
+  /** Cached serialized issue JSON (with trailing newline), per issue number. */
+  issueJsonCache: Map<number, Buffer>;
 }
 
+const GLOBAL_ID_CACHE = new Map<string, string>();
+
 export function globalId(kind: string, ...parts: (string | number)[]): string {
-  return Buffer.from(`${kind}:${parts.join(':')}`, 'utf8').toString('base64');
+  const key = `${kind}:${parts.join(':')}`;
+  const hit = GLOBAL_ID_CACHE.get(key);
+  if (hit !== undefined) return hit;
+  const value = Buffer.from(key, 'utf8').toString('base64');
+  if (GLOBAL_ID_CACHE.size >= 4096) GLOBAL_ID_CACHE.clear();
+  GLOBAL_ID_CACHE.set(key, value);
+  return value;
 }
 
 export function parseGlobalId(id: string): { kind: string; parts: string[] } | null {
@@ -752,6 +784,10 @@ export class Forge {
       nextNumber: 1,
       nextCommentId: 1,
       seq: this.seq(),
+      verified: new Set(),
+      packCache: new Map(),
+      adV0Cache: new Map(),
+      issueJsonCache: new Map(),
     };
     this.nextRepoId += 1;
     this.repos.set(this.key(owner, name), repo);
@@ -779,6 +815,7 @@ export class Forge {
     const comment: IssueComment = { id: repo.nextCommentId, body };
     repo.nextCommentId += 1;
     issue.comments.push(comment);
+    repo.issueJsonCache.delete(issue.number);
     return comment;
   }
 
